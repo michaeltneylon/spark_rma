@@ -26,7 +26,7 @@ class Mock(MagicMock):
         return MagicMock()
 
 MOCK_MODULES = ['numpy', 'pandas', 'pyspark', 'pyspark.sql', 'pyspark.conf',
-                'fastparquet']
+                'pyspark.sql.functions', 'pyspark.sql.types','fastparquet']
 sys.modules.update((mod_name, Mock()) for mod_name in MOCK_MODULES)
 
 
