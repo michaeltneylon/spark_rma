@@ -1,0 +1,210 @@
+# RMA
+
+These scripts are steps for RMA (Robust Multi-array Average) using Spark.
+
+## Order of Operations
+
+1. Annotation and Background Correction -- (not in Spark)
+2. Quantile Normalization
+3. Median Polish
+
+## Annotation and Background Correction
+
+[backgroundCorrect.R](backgroundCorrect.R)
+
+This step is completed in R. It will read in the raw CEL files to convert them to text, annotate PM probes to targets,
+and background correct.
+This script is written to process just one file with intention to submit as an array job on an HPC cluster.
+
+Besides the CEL files, this script also requires a perfect match probe list for targets as input. This is a list of the
+probe IDs for the type of array used that are perfect match (PM) probe and which targets (probeset or transcript_cluster)
+to which they belong. The input format for this is an R Data file with a list called `pm_list` containing two
+data.frames, one named `transcript_annotation` and one named `probeset_annotation`.  Each contains two columns,
+probe and probeset or transcript_cluster. For the examples, there is a
+[script in the helper directory](../helper/hta_annotation.R) to generate this file for HTA 2.0 using Bioconductor
+annotations.
+
+Also check out [convert_to_parquet.py](../helper/convert_to_parquet.py) for converting this step's output into parquet
+format for consumption in Spark.
+
+### Usage
+
+```
+usage: backgroundCorrect.R [-h] -i <input> -o <output> -p <probe_list> -a <annotation_type> [-f <output_format>]
+
+RMA Annotation and Background Correction. Specify an input file, output path,
+and the annotation file path. This only works on one input file at a time, to
+support array jobs.
+
+  -h --help             show this helpful message
+  -i --input <input>    Absolute path to input CEL file (can be gzipped).
+  -o --output <output>  Output path.
+  -p --probe_list <probe_list>
+                        R Binary file with list of data.frames containing
+                        perfect match (PM) probes for the targets of interest
+                        on the specific type of array.
+  -a --annotation_type <annotation_type>  \
+                        Choose the summarization target, either tc (transcript
+                        cluster) or ps (probeset). choices={ps,tc}.
+  -f --output_format <output_format>  \
+                        Choose if you want a flat file or
+                        compressed with gzip. choices={gzip,text}.\
+                        [default: text]
+```
+
+## Quantile Normalization
+
+
+The input must also be in parquet format. See [convert_to_parquet.py](../helper/convert_to_parquet.py)
+
+```
+usage: spark-submit quantile_normalization.py [-h] [-v] -i INPUT [-o OUTPUT]
+
+    Quantile Normalization of background corrected CEL files.
+
+    The summarization target level is chosen in the previous step of
+    Background Correction and inferred here. Input is a parquet file or
+    directory of parquet files with background corrected samples. The
+    required input headers:
+
+    - SAMPLE
+    - PROBE
+    - PROBESET or TRANSCRIPT_CLUSTER
+    - INTENSITY_VALUE
+
+    The output of this step is a parquet file of quantile normalized
+    samples with the headers:
+
+    - SAMPLE
+    - PROBE
+    - PROBESET or TRANSCRIPT_CLUSTER
+    - NORMALIZED_INTENSITY_VALUE
+
+
+optional arguments:
+  -h, --help            show this help message and exit
+  -v, --verbose         Enable Verbose logging
+  -i INPUT, --input INPUT
+                        Input path to directory of background corrected CEL
+                        files in parquet format.
+  -o OUTPUT, --output OUTPUT
+                        Output filename
+```
+
+example configuration on 1 master r4.2xlarge and 4 worker r4.8xlarge EMR cluster for a 908 HTA 2.0 sample data set:
+
+```
+spark-submit \
+  --driver-memory=55G \
+  --executor-memory=10G \
+  --conf spark.yarn.executor.memoryOverhead=1500M \
+  --conf spark.dynamicAllocation.maxExecutors=128 \
+  --conf spark.sql.shuffle.partitions=908 \
+  quantile_normalization.py \
+  -i background_corrected.parquet \
+  -o quantile_normalized.parquet
+```
+
+
+## Median Polish
+
+[median_polish.py](median_polish.py)
+
+Summarization step using Tukey's Median Polish. This step groups data at the level you specify, transcript cluster or
+probeset. Then, probes across all samples within that grouping are summarized using median polish to
+return an expression value for each sample in the grouping.
+
+```
+usage: spark-submit median_polish.py [-h] [-v] -i INPUT [-o OUTPUT]
+                                      -ns NUMBER_SAMPLES
+                                     [-rn REPARTITION_NUMBER]
+
+    Summarization step of RMA using Median Polish.
+
+    Median Polish summarizes probes within a group. That group can be probes
+    with the same transcript cluster and/or probeset region.
+
+    The input to this should be the parquet output from quantile
+    normalization. The grouping is inferred from the input format as
+    generated by the annotation during the background correction step.
+    Specify the summarization type in the background correction step to
+    determine the grouping choice here.
+
+    The input headers from quantile normalization:
+
+    - SAMPLE
+    - PROBE
+    - PROBESET or TRANSCRIPT_CLUSTER
+    - NORMALIZED_INTENSITY_VALUE
+
+    The output format:
+
+    - PROBESET or TRANSCRIPT_CLUSTER
+    - SAMPLE
+    - VALUE
+
+
+optional arguments:
+  -h, --help            show this help message and exit
+  -v, --verbose         Enable verbose logging
+  -i INPUT, --input INPUT
+                        Input path
+  -o OUTPUT, --output OUTPUT
+                        Output filename
+  -ns NUMBER_SAMPLES, --number_samples NUMBER_SAMPLES
+                        Number of samples. Explicitly stating it here is much
+                        faster than making Spark count the records. This helps
+                        set partitions.
+  -rn REPARTITION_NUMBER, --repartition_number REPARTITION_NUMBER
+                        Number of partitions to use when running median
+                        polish. This determines how many groupings get
+                        collected into each task, which impacts processing
+                        time and memory consumption. The default is the number
+                        of samples if left unset.
+```
+
+example configuration on 1 master r4.2xlarge and 4 worker r4.8xlarge EMR cluster for a data set with 908 HTA 2.0 samples:
+
+```
+spark-submit \
+ --driver-memory=55G \
+ --executor-memory=8G \
+ --conf spark.yarn.executor.memoryOverhead=1500M \
+ --conf spark.dynamicAllocation.maxExecutors=128 \
+ median_polish.py \
+ -i quantile_normalized.parquet \
+ -o tc_expression.parquet \
+ -ns 908 -rn 30000
+```
+
+
+### Median Polish Configuration
+
+A few settings are tricky to get right on median polish. Executor Memory and Repartition Number.
+
+- Executor Memory: Memory per executor not only allocates how much memory the YARN container can have but will affect the total number of executors.
+More RAM per executor may decrease the number of executors and cores that can be utilized, but sometimes this is necessary
+if the tasks demand more RAM.
+  - In Spark on YARN, executor memory is defined by `--executor-memory=` and `--conf spark.yarn.executor.memoryOverhead=`
+  - In Spark standalone, just `--executor-memory` is necessary. If in single node with a driver only, just specify the
+  number of cores and total `--driver-memory`.
+- `repartition number`: the number of partitions we repartition to when grouping by our summarization target (e.g. Transcript Cluster or Probeset).
+This determines how many tasks our median polish step of summarization will use. Each task can summarize 1 or more targets, which it can do serially within each task
+while tasks are processed in parallel across executors.
+  - Repartition number is set as a CLI arg `-rn` or `--repartition_number`
+
+Setting the repartition number and executor memory is a difficult problem that is not easy to determine *a priori*
+due to the non-linear growth of memory consumption in median polish in proportion to its growth in number of samples
+and also due to the distribution skew in probe to summarization target associations. This means
+the transcripts or probesets with the largest number of probes will determine the memory settings for all executors.
+It sometimes require trial and error just to get it to run without task failures and even more fine tuning for optimal
+settings to get the fastest times.
+
+The ideal setting is the minimum executor memory as first priority and then the minimum repartition number allowed
+by the previously set executor memory. Increasing executor memory can lead to under-utilization of resources since
+it may decrease the number of executors. A safe way to determine the minimum executor memory is to set the repartition
+number to its maximum, or number of targets (transcript clusters or probesets) for the type of array used. Then start
+at an equal share of memory for each core/executor and increase incrementally until tasks stop failing. Then, to get
+the fastest configuration from less shuffling and avoiding empty partitions, decrease the repartition number to
+the lowest possible number without tasks failing. This may also require trial and error due to how the data is repartitioned.
+
