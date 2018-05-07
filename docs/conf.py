@@ -12,10 +12,21 @@
 # add these directories to sys.path here. If the directory is relative to the
 # documentation root, use os.path.abspath to make it absolute, like shown here.
 #
+from unittest.mock import MagicMock
 import os
 import sys
 sys.path.insert(0, os.path.abspath('..'))
 import sphinx_rtd_theme
+
+
+# --- skip installing some dependencies to build docs ----
+class Mock(MagicMock):
+    @classmethod
+    def __getattr__(cls, name):
+        return MagicMock()
+
+MOCK_MODULES = ['numpy', 'pandas', 'pyspark', 'fastparquet']
+sys.modules.update((mod_name, Mock()) for mod_name in MOCK_MODULES)
 
 
 # -- Project information -----------------------------------------------------
@@ -160,7 +171,7 @@ man_pages = [
 #  dir menu entry, description, category)
 texinfo_documents = [
     (master_doc, 'SparkRMA', 'SparkRMA Documentation',
-     author, 'SparkRMA', 'One line description of project.',
+     author, 'SparkRMA', 'Robust Multi-array Average (RMA) In Spark',
      'Miscellaneous'),
 ]
 
