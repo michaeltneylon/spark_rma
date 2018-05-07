@@ -1,11 +1,12 @@
-# Robust Multi-array Average (RMA) using Spark
+# SparkRMA: a scalable implementation of Robust Multi-array Average (RMA) in Apache Spark
+
+Read the [documentation](http://sparkrma.readthedocs.io) for background information and a tutorial.
 
 See the subdirectories for more detailed READMEs including usage of programs.
 
 ## contents
 - spark_rma
 - helper
-- documentation
 
 ## spark_rma
 
@@ -45,7 +46,3 @@ JVM.
 
 Many examples have been shown for HTA 2.0. The annotation and background correction step requires an input specific
 to the array type. In this script, this file is generated from Bioconductor for HTA 2.0.
-
-## Documentation
-
-View the documentation to follow a tutorial walking through an example. See the [docs directory](docs/) to build them.
