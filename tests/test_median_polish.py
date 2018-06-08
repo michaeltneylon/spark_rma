@@ -83,7 +83,7 @@ def test_transcript_grouping(spark_session):
         num_samples=6,
         repartition_number=6)
     df = testing_object.udaf(data)
-    expected_headers = ['TRANSCRIPT_CLUSTER', 'SAMPLE', 'VALUE']
+    expected_headers = ['SAMPLE', 'TRANSCRIPT_CLUSTER', 'VALUE']
     assert expected_headers == df.columns
     assert len(df.collect()) > 0  # has results
 
@@ -100,7 +100,7 @@ def test_probeset_grouping(spark_session):
         num_samples=6,
         repartition_number=6)
     df = testing_object.udaf(data)
-    expected_headers = ['PROBESET', 'SAMPLE', 'VALUE']
+    expected_headers = ['SAMPLE', 'PROBESET', 'VALUE']
     assert expected_headers == df.columns
     assert len(df.collect()) > 0  # has results
 
@@ -168,11 +168,14 @@ def test_known_results():
     import numpy as np
     with np.errstate(divide='ignore'):
         data = [[_[0], _[1], np.log2(_[2])] for _ in data]
-    data = [[str(_) for _ in x] for x in data]
-    data = [','.join(_) for _ in data]
+    import pandas as pd
+    data = pd.DataFrame(data, columns=['SAMPLE', 'PROBE', 'VALUE'])
+    data['TARGET'] = 'target'  # requires a target name.. we just have the
+    # one group here though.
     result = median_polish.probe_summarization(data)
-    # expected results from R's preprocessCore subColSummarizeMedianpolishLog
+    result = result.drop('TARGET', axis=1).values.tolist()
 
+    # expected results from R's preprocessCore subColSummarizeMedianpolishLog
     expected = [('1-24', 3.807355), ('25-74', 2.807355), ('75-199', 3),
                 ('200++', 3.906891), ('NA', None)]
     # filter.. this example isn't great, log2(0) gives us -inf/NaN
