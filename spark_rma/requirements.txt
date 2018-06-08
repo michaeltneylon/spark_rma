@@ -1,3 +1,4 @@
 pandas
 numpy
 pyspark
+PyArrow>=0.8.0
