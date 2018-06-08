@@ -11,7 +11,7 @@ Create a script at s3://<bucket_name>/bootstrap/install_dependencies.sh as:
 ```
 #! /bin/bash
 
-sudo pip install pandas
+sudo pip install pandas PyArrow
 ```
 
 ### Console Setup

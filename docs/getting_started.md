@@ -17,7 +17,7 @@ Refer to the canonical publications on this topic:
 
 ## Requirements
 
-- Spark 2.0.0+
+- Spark 2.3.0+
 
 ## Installation
 
@@ -32,7 +32,8 @@ worker node. Currently that includes:
 
 - pandas
 
-Write a bootstrap script and store it in S3 to install pandas on each node:
+Write a bootstrap script and store it in S3 to install pandas and PyArrow on
+each node:
 
-`sudo pip install pandas`
+`sudo pip install pandas PyArrow`
 
