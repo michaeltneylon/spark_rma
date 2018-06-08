@@ -28,26 +28,23 @@ import sys
 from pyspark.sql import SparkSession
 from pyspark.conf import SparkConf
 # pylint: disable=no-name-in-module
-# collect_list and col are not being found in path but are legitimate
-from pyspark.sql.functions import udf, concat_ws, collect_list, \
-    explode, log2, col
+# not being found in path but are legitimate
+from pyspark.sql.functions import log2, pandas_udf, PandasUDFType
 # pylint: enable=no-name-in-module
-from pyspark.sql.types import StringType, ArrayType
 
 
-def probe_summarization(grouped_values):
+def probe_summarization(data_frame):
     """
     Summarization step to be pickled by Spark as a UDF.
-    Receives a groupings data in a list, unpacks it, performs median
+    Receives a groupings data in a pandas dataframe and performs median
     polish, calculates the expression values from the median polish matrix
-    results, packs it back up, and return it to a new spark Dataframe.
+    results, and return it to a new spark Dataframe.
 
-    :param grouped_values: a list of strings because spark concatenated all the
-      values into one string for each sample. Each item is a sample,probe,
-      value format and all the rows in the input belong to a grouping key
-      that spark handled (transcript_cluster or probeset)
+    :param data_frame: spark dataframe input to pandas udf as pandas
+     dataframe. Expect format of SAMPLE, TRANSCRIPT_CLUSTER/PROBESET, PROBE,
+     VALUE This input should be for one target/group.
 
-    :return: a list of lists where each item is length two with (sample, value)
+    :return: pandas dataframe with summarized values. SAMPLE, TARGET, VALUE.
     """
 
     # need to do all the imports here so they can be pickled and sent to
@@ -71,16 +68,7 @@ def probe_summarization(grouped_values):
          transcript cluster).
         """
         # we get our data, we need to unpack as sample, probe, value
-        samples = []
-        probes = []
-        values = []
-        for each in input_data:
-            sample, probe, value = each.split(',')
-            samples.append(sample)
-            probes.append(int(probe))  # was pass as string from spark
-            values.append(float(value))  # passed as string from spark
-        data = pd.DataFrame(
-            {'SAMPLE': samples, 'PROBE': probes, 'VALUE': values})
+        data = input_data[['SAMPLE', 'PROBE', 'VALUE']]
         # we may have duplicate probes, let's rename them but keep them matched
         # so we don't have duplicate indices in the pivoted data frame. sort
         #  values, group by sample and within groups replace probe with row
@@ -119,7 +107,7 @@ def probe_summarization(grouped_values):
             0.0,
             index=matrix.columns.values,
             dtype=np.float64  # pylint: disable=no-member
-            )
+        )
         grand_effect = float(0.0)
         sum_of_absolute_residuals = 0
         converged = False
@@ -152,7 +140,7 @@ def probe_summarization(grouped_values):
             # changed less than the eps between iterations or is 0.
             new_sar = np.absolute(matrix).sum().sum()
             if abs(new_sar - sum_of_absolute_residuals) <= eps * new_sar or \
-               new_sar == 0:
+                    new_sar == 0:
                 converged = True
                 logging.debug(
                     "Convergence reached after %s iterations", i + 1)
@@ -179,12 +167,27 @@ def probe_summarization(grouped_values):
         expression = row_effect + grand_effect
         return expression
 
-    data_frame = split_and_dedup(grouped_values)
+    def get_target(data):
+        """
+        Get the target for this grouping. This is a transcript or probeset.
+        The intermediate steps are specific to a target, so remove this
+        label for merging back later.
+        :param data: input data frame with SAMPLE, TARGET, PROBE, VALUE
+        :return: string value defining the target name
+        """
+        targets = data['TARGET'].unique()
+        if len(targets) > 1:
+            raise ValueError('More than one target found, possible poor '
+                             'groupby')
+        return targets[0]
+
+    target = get_target(data_frame)
+    data_frame = split_and_dedup(data_frame)
     result = gene_expression(data_frame)
-    index = result.index.values.tolist()  # get the sample names
-    result = result.values.tolist()  # convert pandas df to list,
-    # and coerce values into list of lists of [['sample', value], ] structure.
-    result = list(zip(index, result))
+    result = pd.DataFrame({
+        'SAMPLE': result.index,
+        'TARGET': target,
+        'VALUE': result.values})
     return result
 
 
@@ -199,70 +202,38 @@ class Summary(object):
         self.input_data = input_data
         self.num_samples = num_samples
         self.repartition_number = repartition_number
-        self.group_keys = kwargs.get('grouping')
+        self.group_key = kwargs.get('grouping')
 
     def udaf(self, data):
         """
         Apply median polish to groupBy keys and return value for each sample
         within that grouping.
 
-        This is a hacked/workaround user-defined aggregate function (UDAF) that
-        passes the grouped data to
-        python to do median polish and return the result back
-        to the dataframe.
-
         :returns: spark dataframe
         """
-        # register the medianpolish as a UDF
-        medpol = udf(probe_summarization, ArrayType(ArrayType(StringType())))
         # repartition by our grouping keys
-        if self.group_keys not in [
-                ['TRANSCRIPT_CLUSTER'],
-                ['PROBESET']
+        if self.group_key not in [
+                'TRANSCRIPT_CLUSTER', 'PROBESET'
         ]:
             raise Exception("Invalid grouping keys.")
         data = data.withColumnRenamed('NORMALIZED_INTENSITY_VALUE', 'VALUE')
-        data = data.repartition(self.repartition_number, self.group_keys)
+        data = data.repartition(self.repartition_number, self.group_key)
 
         # log 2 values
         data = data.withColumn('VALUE', log2(data['VALUE']).alias('VALUE'))
 
-        # group the data while concatenating rest of columns into one value
-        # so we can pass it to collect, one value(list) per row and a list of
-        # lists for the whole grouping, so that we can give it to our UDF as
-        # one item which returns back one item (array or arrays)
-        data = data.withColumn(
-            'data', concat_ws(',', 'SAMPLE', 'PROBE', 'VALUE')) \
-            .groupBy(self.group_keys) \
-            .agg(collect_list('data')
-                 .alias('data')) \
-            .withColumn('data', medpol('data'))
+        # rename our group keys to TARGET to simplify UDF
+        data = data.withColumnRenamed(self.group_key, 'TARGET')
 
-        def gen_cols(other_cols):
-            """
-            Create a list for select().
-            select() can take one list, or *args. generating the grouping
-            keys as columns and adding other column selections to the same
-            list.
-
-            :param other_cols: list of other column selections
-            :type other_cols: list
-
-            :returns: single list of columns, expressions, etc. for select()
-            """
-            cols = [col(s) for s in self.group_keys]
-            cols += other_cols
-            return cols
-
-        # unpack the first level of nesting vertically, so each array in the
-        # array is a new row (per sample)
-        data = data.select(gen_cols([explode(data['data']).alias(
-            "SAMPLEVALUE")]))
-
-        # unpack the final nesting laterally, into two new columns
-        data = data.select(gen_cols([
-            data['SAMPLEVALUE'].getItem(0).alias('SAMPLE'),
-            data['SAMPLEVALUE'].getItem(1).alias("VALUE")]))
+        # register the pandas UDF for median polish
+        medpol = pandas_udf(probe_summarization,
+                            "SAMPLE string, TARGET string, VALUE double",
+                            PandasUDFType.GROUPED_MAP)
+        # group data by target so we can summarize probes across samples
+        # for each target using a pandas UDF
+        data = data.groupby('TARGET').apply(medpol)
+        # rename target back to appropriate selection
+        data = data.withColumnRenamed('TARGET', self.group_key)
 
         data = data.repartition(int(self.num_samples))
         return data
@@ -282,7 +253,7 @@ class TranscriptSummary(Summary):
     def __init__(self, spark, input_data, num_samples, repartition_number):
         super(TranscriptSummary, self).__init__(
             spark, input_data, num_samples, repartition_number,
-            grouping=['TRANSCRIPT_CLUSTER'])
+            grouping='TRANSCRIPT_CLUSTER')
 
 
 class ProbesetSummary(Summary):
@@ -291,7 +262,7 @@ class ProbesetSummary(Summary):
     def __init__(self, spark, input_data, num_samples, repartition_number):
         super(ProbesetSummary, self).__init__(
             spark, input_data, num_samples, repartition_number,
-            grouping=['PROBESET'])
+            grouping='PROBESET')
 
 
 def infer_grouping_and_summarize(spark, input_file, output_file, num_samples,
@@ -327,6 +298,7 @@ def infer_grouping_and_summarize(spark, input_file, output_file, num_samples,
 
 def command_line():
     """Collect and validate command line arguments."""
+
     class MyParser(argparse.ArgumentParser):
         """
         Override default behavior, print the whole help message for any CLI
@@ -340,27 +312,27 @@ def command_line():
 
     parser = MyParser(description="""
     Summarization step of RMA using Median Polish.
-    
+
     Median Polish summarizes probes within a group. That group can be probes 
     with the same transcript cluster and/or probeset region.
-    
+
     The input to this should be the parquet output from quantile 
     normalization. The grouping is inferred from the input format as 
     generated by the annotation during the background correction step. 
     Specify the summarization type in the background correction step to 
     determine the grouping choice here.
-    
+
     The input headers from quantile normalization:
-    
+
     - SAMPLE
     - PROBE
     - PROBESET or TRANSCRIPT_CLUSTER
     - NORMALIZED_INTENSITY_VALUE
-    
+
     The output format:
-    
-    - PROBESET or TRANSCRIPT_CLUSTER
+
     - SAMPLE
+    - PROBESET or TRANSCRIPT_CLUSTER
     - VALUE
     """,
                       formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -410,7 +382,7 @@ def main():
         num_samples=arguments.number_samples,
         output_file=arguments.output,
         repartition_number=arguments.repartition_number
-        )
+    )
 
     logging.info("Complete.")
     spark_session.stop()
